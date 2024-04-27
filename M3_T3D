@@ -1,0 +1,115 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <algorithm>
+#include <mpi.h>
+#include <chrono>
+
+using namespace std;
+using namespace std::chrono;
+
+const int MAX_TIMESTAMP_LEN = 20;
+
+struct TrafficData {
+    char timestamp[MAX_TIMESTAMP_LEN];
+    int light_id;
+    int car_count;
+};
+
+bool sortByCarCount(const TrafficData& a, const TrafficData& b) {
+    return a.car_count > b.car_count;
+}
+
+int main(int argc, char** argv) {
+    int rank, size;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    auto start = high_resolution_clock::now();
+
+    vector<TrafficData> trafficData;
+    vector<string> timestamps;
+
+    if (rank == 0) {
+        ifstream file("data.txt");
+        if (!file) {
+            cerr << "Error opening file" << endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        string line;
+        while (getline(file, line)) {
+            istringstream iss(line);
+            TrafficData data;
+            if (iss >> data.timestamp >> data.light_id >> data.car_count) {
+                trafficData.push_back(data);
+            } else {
+                cerr << "Error reading line: " << line << endl;
+            }
+        }
+        file.close();
+
+        for (const auto& data : trafficData) {
+            if (timestamps.empty() || timestamps.back() != data.timestamp) {
+                timestamps.push_back(data.timestamp);
+            }
+        }
+
+        int timestampCount = timestamps.size();
+        MPI_Scatter(&timestampCount, 1, MPI_INT, MPI_IN_PLACE, 0, MPI_INT, 0, MPI_COMM_WORLD);
+        char buf[MAX_TIMESTAMP_LEN * timestampCount];
+        for (size_t i = 0; i < timestamps.size(); ++i) {
+            strcpy(buf + i * MAX_TIMESTAMP_LEN, timestamps[i].c_str());
+        }
+        MPI_Scatter(buf, MAX_TIMESTAMP_LEN, MPI_CHAR, MPI_IN_PLACE, 0, MPI_CHAR, 0, MPI_COMM_WORLD);
+    } else {
+        // Receive timestamps from rank 0
+        int timestampCount;
+        MPI_Scatter(nullptr, 0, MPI_INT, &timestampCount, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        char buf[MAX_TIMESTAMP_LEN * timestampCount];
+        MPI_Scatter(nullptr, MAX_TIMESTAMP_LEN, MPI_CHAR, buf, MAX_TIMESTAMP_LEN, MPI_CHAR, 0, MPI_COMM_WORLD);
+        for (int i = 0; i < timestampCount; ++i) {
+            timestamps.push_back(string(buf + i * MAX_TIMESTAMP_LEN));
+        }
+    }
+
+    // Broadcast traffic data to all processes
+    int dataSize = trafficData.size();
+    MPI_Bcast(&dataSize, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (rank != 0) {
+        trafficData.resize(dataSize);
+    }
+    MPI_Bcast(trafficData.data(), dataSize * sizeof(TrafficData), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    for (const auto& timestamp : timestamps) {
+        if (rank == 0) {
+            cout << "Timestamp: " << timestamp << endl;
+        }
+        vector<TrafficData> timestampData;
+        for (const auto& data : trafficData) {
+            if (data.timestamp == timestamp) {
+                timestampData.push_back(data);
+            }
+        }
+        sort(timestampData.begin(), timestampData.end(), sortByCarCount);
+        for (size_t i = 0; i < min<size_t>(5, timestampData.size()); ++i) {
+            if (rank == 0) {
+                cout << "Traffic Light " << timestampData[i].light_id << ": Number of Cars: " << timestampData[i].car_count << endl;
+            }
+        }
+        if (rank == 0) {
+            cout << endl;
+        }
+    }
+    auto end = high_resolution_clock::now();
+    duration<double, std::micro> elapsed = end - start; // Convert to microseconds
+    double totalExecutionTime;
+    MPI_Reduce(&elapsed, &totalExecutionTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) {
+        cout << "Total Execution Time: " << totalExecutionTime << " microseconds" << endl; // Print in microseconds
+    }
+
+    MPI_Finalize();
+    return 0;
+}
